@@ -191,10 +191,9 @@ def capture_and_infer():
         ret, frame = cap.read()
         if not ret:
             continue
-
+        frame = cv2.flip(frame, 0)  # upside down
         frame_counter += 1
         run_inference = (frame_counter % INFER_EVERY_N_FRAMES == 0)
-
         if run_inference:
             futures = {
                 executor.submit(run_model, face_model,  frame, CONFIDENCE):                  "face",
