@@ -30,9 +30,9 @@ _warmup = cv2.VideoCapture(0)
 _warmup.release()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-FACE_MODEL_PATH  = "best.onnx"     # custom face weights
+FACE_MODEL_PATH  = "general_model.onnx"     # custom face weights
 PHONE_MODEL_PATH = "yolo12n.pt"    # stock YOLO12n — downloaded automatically on first run
-HAND_MODEL_PATH  = "best7.onnx"    # custom hand weights
+HAND_MODEL_PATH  = "hand_model.onnx"    # custom hand weights
 
 # COCO class index for "cell phone" — do not change
 PHONE_CLASS_ID   = 67
