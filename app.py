@@ -1,17 +1,17 @@
 """
 Continuous Flask webcam server with triple YOLO inference + doomscroll detection.
-ONNX edition — face + hand use custom .onnx weights; phone uses stock YOLO12n
-filtered to the COCO "cell phone" class only (class index 67).
+Hailo edition — all three models run on the Hailo-8L via .hef files.
 
-NOTE: YOLO12 uses FlashAttention internally. It runs fine on CPU and most
-modern NVIDIA GPUs (Ampere / Turing or newer). On unsupported hardware
-ultralytics automatically falls back to standard attention — no code change
-needed, but GPU inference will be faster.
+Prerequisites (on the Pi):
+    sudo apt install hailo-all
+    pip install flask opencv-python numpy requests
 
-Run:
-    pip install flask opencv-python "ultralytics>=8.3.50" onnxruntime requests
-    python app.py
-    Open: http://localhost:5002
+HEF files expected in the same directory as this script:
+    best_face.hef   — custom face model
+    yolo12n.hef     — YOLO12n compiled for phone detection (cell phone class = 67)
+    best_hand.hef   — custom hand model
+
+Open: http://<pi-ip>:5002
 """
 
 import os
@@ -21,57 +21,231 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
+import numpy as np
 import requests
 from flask import Flask, Response, render_template_string
-from ultralytics import YOLO
+
+from hailo_platform import (
+    HEF,
+    VDevice,
+    HailoStreamInterface,
+    InferVStreams,
+    ConfigureParams,
+    InputVStreamParams,
+    OutputVStreamParams,
+    FormatType,
+)
 
 os.environ["OPENCV_AVFOUNDATION_SKIP_AUTH"] = "0"
-_warmup = cv2.VideoCapture(0)
-_warmup.release()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-FACE_MODEL_PATH  = "best.onnx"     # custom face weights
-PHONE_MODEL_PATH = "yolo12n.pt"    # stock YOLO12n — downloaded automatically on first run
-HAND_MODEL_PATH  = "best7.onnx"    # custom hand weights
+FACE_HEF_PATH  = "best_face.hef"
+PHONE_HEF_PATH = "yolo12n.hef"
+HAND_HEF_PATH  = "best_hand.hef"
 
-# COCO class index for "cell phone" — do not change
+# COCO class index 67 = "cell phone" — only used for the phone model
 PHONE_CLASS_ID   = 67
 PHONE_CLASS_NAME = "cell phone"
 
-CAMERA_INDEX     = 0
-FRAME_WIDTH      = 640
-FRAME_HEIGHT     = 480
+CAMERA_INDEX = 0
+FRAME_WIDTH  = 640
+FRAME_HEIGHT = 480
 
 INFER_EVERY_N_FRAMES = 6
 
-CONFIDENCE       = 0.4
-DOOMSCROLL_CONF  = 0.2
+CONFIDENCE      = 0.4   # minimum score for drawing boxes
+DOOMSCROLL_CONF = 0.2   # minimum score to count toward doomscroll logic
 
-PROXIMITY_RATIO  = 0.7
+PROXIMITY_RATIO = 0.7
 
-FACE_CLASSES     = {"face", "person", "head"}
-HAND_CLASSES     = {"hand", "fist", "palm", "open_palm", "closed_fist"}
+# Class name sets — matched against names dicts defined per model below
+FACE_CLASSES  = {"face", "person", "head"}
+HAND_CLASSES  = {"hand", "fist", "palm", "open_palm", "closed_fist"}
 
-VOTE_WINDOW      = 15
-VOTE_THRESHOLD   = 0.50
+VOTE_WINDOW    = 15
+VOTE_THRESHOLD = 0.50
 
 WEBHOOK_URL       = "http://localhost:5001/game/doomscrolldetect"
 WEBHOOK_URL_FALSE = "http://localhost:5001/game/doomscrolldetectfalse"
 COOLDOWN_SEC      = 0.5
 # ─────────────────────────────────────────────────────────────────────────────
 
-app         = Flask(__name__)
-face_model  = YOLO(FACE_MODEL_PATH)
-phone_model = YOLO(PHONE_MODEL_PATH)   # stock YOLOv8n
-hand_model  = YOLO(HAND_MODEL_PATH)
 
-lock           = threading.Lock()
-latest_frame   = None
-last_trigger   = 0.0
-doomscroll_on  = False
-dummy          = False
+# ── Hailo model wrapper ───────────────────────────────────────────────────────
 
-vote_window    = deque(maxlen=VOTE_WINDOW)
+class HailoModel:
+    """
+    Wraps a single .hef model for synchronous inference.
+
+    The VDevice and network group are initialised once at startup.
+    InferVStreams is opened fresh each call — this is safe and avoids
+    the complexity of sharing a pipeline across threads.
+
+    names: dict mapping int class index → str class name.
+           For COCO models supply the full 80-class dict or a subset.
+           For custom models supply whatever your training used.
+    """
+
+    def __init__(self, hef_path: str, names: dict):
+        self.hef_path = hef_path
+        self.names    = names
+
+        self.hef    = HEF(hef_path)
+        self.target = VDevice()
+
+        configure_params = ConfigureParams.create_from_hef(
+            hef=self.hef, interface=HailoStreamInterface.PCIe
+        )
+        self.network_group        = self.target.configure(self.hef, configure_params)[0]
+        self.network_group_params = self.network_group.create_params()
+
+        input_info        = self.hef.get_input_vstream_infos()[0]
+        self.input_name   = input_info.name
+        self.input_h, self.input_w, _ = input_info.shape
+
+        # UINT8 input (0-255 BGR→RGB) — avoids float normalisation on the Pi CPU
+        self.input_params  = InputVStreamParams.make(
+            self.network_group, format_type=FormatType.UINT8
+        )
+        self.output_params = OutputVStreamParams.make(
+            self.network_group, format_type=FormatType.FLOAT32
+        )
+        self.output_infos = self.hef.get_output_vstream_infos()
+
+        print(f"[Hailo] Loaded {os.path.basename(hef_path)} "
+              f"  input={self.input_name} {self.input_h}×{self.input_w}")
+
+    def preprocess(self, frame: np.ndarray) -> np.ndarray:
+        """Resize → RGB → uint8, add batch dim."""
+        resized = cv2.resize(frame, (self.input_w, self.input_h))
+        rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        return rgb.astype(np.uint8)
+
+    def __call__(self, frame: np.ndarray, conf: float = CONFIDENCE,
+                 classes: list = None):
+        """
+        Run inference on one BGR frame.
+        Returns a list of dicts:
+            [{"box": [x1,y1,x2,y2], "conf": float, "cls": int, "label": str}, ...]
+        Coordinates are absolute pixels in the ORIGINAL frame's space.
+        """
+        orig_h, orig_w = frame.shape[:2]
+        preprocessed   = self.preprocess(frame)
+        input_data      = {self.input_name: np.expand_dims(preprocessed, 0)}
+
+        with InferVStreams(self.network_group,
+                          self.input_params,
+                          self.output_params) as pipeline:
+            with self.network_group.activate(self.network_group_params):
+                raw = pipeline.infer(input_data)
+
+        return self._postprocess(raw, orig_w, orig_h, conf, classes)
+
+    def _postprocess(self, raw: dict, orig_w: int, orig_h: int,
+                     min_conf: float, filter_classes: list):
+        """
+        Decode Hailo YOLO NMS output.
+
+        Hailo Model Zoo compiles YOLO with NMS baked in.  The merged output
+        tensor has shape (1, N, 6) where each row is:
+            [y_min, x_min, y_max, x_max, score, class_id]  — normalised 0-1.
+
+        If your compilation produced un-merged per-class tensors (older DFC
+        versions), set HAILO_MERGED_NMS = False below and adjust accordingly.
+        """
+        HAILO_MERGED_NMS = True   # ← set False for multi-tensor NMS output
+
+        detections = []
+
+        if HAILO_MERGED_NMS:
+            # Collect the single merged output tensor
+            tensor = None
+            for name, arr in raw.items():
+                arr = np.array(arr)
+                if arr.ndim == 3 and arr.shape[-1] == 6:
+                    tensor = arr[0]   # shape (N, 6)
+                    break
+            if tensor is None:
+                # Fallback: flatten whatever came back
+                for arr in raw.values():
+                    arr = np.array(arr).reshape(-1, 6)
+                    tensor = arr
+                    break
+
+            for row in tensor:
+                y1, x1, y2, x2, score, cls_id = row
+                cls_id = int(cls_id)
+                if score < min_conf:
+                    continue
+                if filter_classes is not None and cls_id not in filter_classes:
+                    continue
+                label = self.names.get(cls_id, str(cls_id))
+                # De-normalise to original frame pixels
+                detections.append({
+                    "box":   [x1 * orig_w, y1 * orig_h,
+                              x2 * orig_w, y2 * orig_h],
+                    "conf":  float(score),
+                    "cls":   cls_id,
+                    "label": label,
+                })
+        else:
+            # Per-class tensor layout: each output is (1, num_boxes_for_class, 5)
+            # where 5 = [y1, x1, y2, x2, score], class given by tensor name.
+            for out_info in self.output_infos:
+                arr     = np.array(raw[out_info.name])[0]   # (M, 5)
+                cls_id  = int(out_info.name.split("_")[-1]) # depends on naming
+                label   = self.names.get(cls_id, str(cls_id))
+                if filter_classes is not None and cls_id not in filter_classes:
+                    continue
+                for row in arr:
+                    y1, x1, y2, x2, score = row
+                    if score < min_conf:
+                        continue
+                    detections.append({
+                        "box":   [x1 * orig_w, y1 * orig_h,
+                                  x2 * orig_w, y2 * orig_h],
+                        "conf":  float(score),
+                        "cls":   cls_id,
+                        "label": label,
+                    })
+
+        return detections
+
+
+# ── COCO names (subset — only what we use) ────────────────────────────────────
+# Full 80-class list would go here; we only need index 67 for inference but
+# keeping a reasonable subset avoids key errors if other classes slip through.
+COCO_NAMES = {
+    0: "person",    24: "backpack", 26: "handbag",
+    41: "cup",      42: "fork",     43: "knife",
+    44: "spoon",    45: "bowl",     46: "banana",
+    63: "laptop",   64: "mouse",    65: "remote",
+    66: "keyboard", 67: "cell phone",
+    73: "book",     74: "clock",    76: "scissors",
+}
+
+# Custom model class names — update these to match your training labels exactly.
+# Indices must match the class indices used during training.
+FACE_NAMES = {0: "face"}          # adjust if your model has more classes
+HAND_NAMES = {0: "hand"}          # adjust if your model has more classes
+
+
+# ── Load models ───────────────────────────────────────────────────────────────
+print("[startup] Loading Hailo models …")
+face_model  = HailoModel(FACE_HEF_PATH,  names=FACE_NAMES)
+phone_model = HailoModel(PHONE_HEF_PATH, names=COCO_NAMES)
+hand_model  = HailoModel(HAND_HEF_PATH,  names=HAND_NAMES)
+print("[startup] All models ready.")
+
+
+# ── Shared state ──────────────────────────────────────────────────────────────
+app           = Flask(__name__)
+lock          = threading.Lock()
+latest_frame  = None
+last_trigger  = 0.0
+doomscroll_on = False
+dummy         = False
+vote_window   = deque(maxlen=VOTE_WINDOW)
 
 
 # ── Geometry helpers ──────────────────────────────────────────────────────────
@@ -92,40 +266,6 @@ def boxes_are_near(box_a, box_b, ratio=PROXIMITY_RATIO):
     dist = ((cx_a - cx_b) ** 2 + (cy_a - cy_b) ** 2) ** 0.5
     threshold = ratio * min(box_diagonal(box_a), box_diagonal(box_b))
     return dist < threshold
-
-
-# ── Box extraction ────────────────────────────────────────────────────────────
-
-def extract_boxes(results, model, target_classes, min_conf):
-    """Generic extractor — matches class name against target_classes set."""
-    boxes = []
-    detections = results[0].boxes
-    if detections is None:
-        return boxes
-    for box in detections:
-        conf  = float(box.conf[0])
-        cls   = int(box.cls[0])
-        label = model.names.get(cls, "").lower()
-        if conf >= min_conf and label in target_classes:
-            boxes.append(box.xyxy[0].tolist())
-    return boxes
-
-
-def extract_phone_boxes(results, min_conf):
-    """
-    Phone-specific extractor: filters strictly by COCO class index 67
-    ('cell phone') so no other YOLOv8n class can sneak in.
-    """
-    boxes = []
-    detections = results[0].boxes
-    if detections is None:
-        return boxes
-    for box in detections:
-        cls  = int(box.cls[0])
-        conf = float(box.conf[0])
-        if cls == PHONE_CLASS_ID and conf >= min_conf:
-            boxes.append(box.xyxy[0].tolist())
-    return boxes
 
 
 # ── Rolling-window vote ───────────────────────────────────────────────────────
@@ -155,20 +295,22 @@ def fire_webhook_false():
         print(f"[doomscroll] webhook failed: {e}")
 
 
-# ── Model runner (for thread pool) ────────────────────────────────────────────
+# ── Draw helpers ──────────────────────────────────────────────────────────────
 
-def run_model(model, frame, conf, classes=None):
-    """
-    Run inference. For the phone model, pass classes=[67] so YOLOv8n only
-    scores the cell-phone head — faster and avoids false positives entirely.
-    """
-    kwargs = {"conf": conf, "verbose": False}
-    if classes is not None:
-        kwargs["classes"] = classes
-    return model(frame, **kwargs)
+def draw_detections(frame, detections, color):
+    for d in detections:
+        x1, y1, x2, y2 = [int(v) for v in d["box"]]
+        label = f"{d['label']} {d['conf']:.2f}"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(frame, label, (x1, max(y1 - 6, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
 
 # ── Main capture + inference loop ─────────────────────────────────────────────
+
+def run_model_thread(model, frame, conf, classes=None):
+    return model(frame, conf=conf, classes=classes)
+
 
 def capture_and_infer():
     global latest_frame, last_trigger, doomscroll_on, dummy
@@ -180,10 +322,10 @@ def capture_and_infer():
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera index {CAMERA_INDEX}")
 
-    cached_face_results  = None
-    cached_phone_results = None
-    cached_hand_results  = None
-    frame_counter        = 0
+    cached_faces  = []
+    cached_phones = []
+    cached_hands  = []
+    frame_counter = 0
 
     executor = ThreadPoolExecutor(max_workers=3)
 
@@ -197,37 +339,36 @@ def capture_and_infer():
 
         if run_inference:
             futures = {
-                executor.submit(run_model, face_model,  frame, CONFIDENCE):                  "face",
-                executor.submit(run_model, phone_model, frame, CONFIDENCE, [PHONE_CLASS_ID]): "phone",
-                executor.submit(run_model, hand_model,  frame, CONFIDENCE):                  "hand",
+                executor.submit(run_model_thread, face_model,  frame, DOOMSCROLL_CONF):                        "face",
+                executor.submit(run_model_thread, phone_model, frame, DOOMSCROLL_CONF, [PHONE_CLASS_ID]):       "phone",
+                executor.submit(run_model_thread, hand_model,  frame, DOOMSCROLL_CONF):                        "hand",
             }
             results_map = {}
             for future in as_completed(futures):
                 results_map[futures[future]] = future.result()
 
-            cached_face_results  = results_map["face"]
-            cached_phone_results = results_map["phone"]
-            cached_hand_results  = results_map["hand"]
+            # Filter to only classes we care about
+            cached_faces  = [d for d in results_map["face"]
+                             if d["label"].lower() in FACE_CLASSES]
+            cached_phones = results_map["phone"]   # already filtered to class 67
+            cached_hands  = [d for d in results_map["hand"]
+                             if d["label"].lower() in HAND_CLASSES]
 
-        if cached_face_results is None:
-            continue
+        # ── Proximity / doomscroll ────────────────────────────────────────────
+        face_boxes  = [d["box"] for d in cached_faces]
+        phone_boxes = [d["box"] for d in cached_phones]
+        hand_boxes  = [d["box"] for d in cached_hands]
 
-        # ── Extract qualifying boxes ──────────────────────────────────────────
-        faces  = extract_boxes(cached_face_results, face_model, FACE_CLASSES, DOOMSCROLL_CONF)
-        phones = extract_phone_boxes(cached_phone_results, DOOMSCROLL_CONF)
-        hands  = extract_boxes(cached_hand_results, hand_model, HAND_CLASSES, DOOMSCROLL_CONF)
-
-        # ── Proximity / doomscroll logic ──────────────────────────────────────
         frame_positive = any(
             boxes_are_near(phone, face) or boxes_are_near(phone, hand)
-            for phone in phones
-            for face  in faces
-            for hand  in hands
+            for phone in phone_boxes
+            for face  in face_boxes
+            for hand  in hand_boxes
         )
 
         vote_triggered = update_vote(frame_positive)
-
         now = time.time()
+
         if vote_triggered:
             doomscroll_on = True
             dummy = True
@@ -241,36 +382,13 @@ def capture_and_infer():
         else:
             doomscroll_on = False
 
-        # ── Draw overlays ─────────────────────────────────────────────────────
-        annotated = cached_face_results[0].plot()
+        # ── Draw ──────────────────────────────────────────────────────────────
+        annotated = frame.copy()
+        draw_detections(annotated, cached_faces,  (0, 255, 0))      # green  — face
+        draw_detections(annotated, cached_phones, (0, 165, 255))    # orange — phone
+        draw_detections(annotated, cached_hands,  (255, 220, 0))    # yellow — hand
 
-        # Phone boxes — orange (only cell phone detections drawn)
-        for box in cached_phone_results[0].boxes:
-            if int(box.cls[0]) != PHONE_CLASS_ID:
-                continue
-            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-            conf = float(box.conf[0])
-            color = (0, 165, 255)
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                annotated, f"cell phone {conf:.2f}", (x1, max(y1 - 6, 12)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA,
-            )
-
-        # Hand boxes — cyan/yellow
-        for box in cached_hand_results[0].boxes:
-            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-            conf  = float(box.conf[0])
-            cls   = int(box.cls[0])
-            label = hand_model.names.get(cls, "hand")
-            color = (255, 220, 0)
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                annotated, f"{label} {conf:.2f}", (x1, max(y1 - 6, 12)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA,
-            )
-
-        # Vote meter bar (bottom strip)
+        # Vote meter (bottom strip)
         vote_ratio  = sum(vote_window) / max(len(vote_window), 1)
         meter_width = int(FRAME_WIDTH * vote_ratio)
         meter_color = (0, 200, 0) if vote_ratio < VOTE_THRESHOLD else (0, 0, 220)
@@ -339,9 +457,9 @@ PAGE = """
   <h1>📱 Doomscroll Detector</h1>
   <img src="/video_feed" alt="live feed"/>
   <p class="meta">
-    Face: <span>{{ face_model_path }}</span> &nbsp;|&nbsp;
-    Phone: <span>{{ phone_model_path }} (cell phone only)</span> &nbsp;|&nbsp;
-    Hand: <span>{{ hand_model_path }}</span><br/>
+    Face: <span>{{ face_hef }}</span> &nbsp;|&nbsp;
+    Phone: <span>{{ phone_hef }} (cell phone only)</span> &nbsp;|&nbsp;
+    Hand: <span>{{ hand_hef }}</span><br/>
     Min conf: <span>{{ conf }}</span> &nbsp;|&nbsp;
     Vote window: <span>{{ vote_window }} frames @ {{ vote_threshold }}</span> &nbsp;|&nbsp;
     Infer every: <span>{{ infer_skip }} frames</span> &nbsp;|&nbsp;
@@ -352,14 +470,15 @@ PAGE = """
 </html>
 """
 
+from flask import render_template_string
 
 @app.route("/")
 def index():
     return render_template_string(
         PAGE,
-        face_model_path=FACE_MODEL_PATH,
-        phone_model_path=PHONE_MODEL_PATH,
-        hand_model_path=HAND_MODEL_PATH,
+        face_hef=FACE_HEF_PATH,
+        phone_hef=PHONE_HEF_PATH,
+        hand_hef=HAND_HEF_PATH,
         conf=DOOMSCROLL_CONF,
         vote_window=VOTE_WINDOW,
         vote_threshold=f"{VOTE_THRESHOLD:.0%}",
@@ -371,6 +490,7 @@ def index():
 
 @app.route("/video_feed")
 def video_feed():
+    from flask import Response
     return Response(
         generate_stream(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
@@ -382,5 +502,5 @@ def video_feed():
 if __name__ == "__main__":
     t = threading.Thread(target=capture_and_infer, daemon=True)
     t.start()
-    print("Server running → http://localhost:5002")
+    print("Server running → http://0.0.0.0:5002")
     app.run(host="0.0.0.0", port=5002, debug=False)
