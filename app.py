@@ -31,8 +31,8 @@ _warmup.release()
 # ─────────────────────────────────────────────────────────────────────────────
  
 # ── Config ────────────────────────────────────────────────────────────────────
-FACE_MODEL_PATH  = "best.pt"    # weights for face detection
-PHONE_MODEL_PATH = "best1.pt"   # weights for phone detection
+FACE_MODEL_PATH  = "best3.pt"    # weights for face detection
+PHONE_MODEL_PATH = "best4.pt"   # weights for phone detection
 CAMERA_INDEX     = 0
 FRAME_WIDTH      = 640
 FRAME_HEIGHT     = 480
@@ -63,7 +63,7 @@ lock          = threading.Lock()
 latest_frame  = None
 last_trigger  = 0.0
 doomscroll_on = False
- 
+trigger_start = None
  
 # ── Proximity helpers ─────────────────────────────────────────────────────────
  
@@ -144,12 +144,22 @@ def capture_and_infer():
         )
  
         now = time.time()
-        if triggered and (now - last_trigger) >= COOLDOWN_SEC:
-            last_trigger = now
-            threading.Thread(target=fire_webhook, daemon=True).start()
- 
-        doomscroll_on = triggered
- 
+        if triggered:
+            if trigger_start is None:
+                trigger_start = now  # start timing
+
+            # Only fire if it's been continuously true for > 1 second
+            if (now - trigger_start) >= 2.0:
+                if (now - last_trigger) >= COOLDOWN_SEC:
+                    last_trigger = now
+                    threading.Thread(target=fire_webhook, daemon=True).start()
+
+            doomscroll_on = True
+
+        else:
+            trigger_start = None  # reset timer
+            doomscroll_on = False
+       
         # ── Draw overlay — merge annotations from both models ─────────────────
         # Start from the face-model annotated frame, then draw phone boxes on top
         annotated = face_results[0].plot()
@@ -168,7 +178,7 @@ def capture_and_infer():
             )
  
         bar_color  = (0, 0, 200) if triggered else (0, 150, 0)
-        label_text = "DOOMSCROLLING DETECTED!" if triggered else "No doomscroll"
+        label_text = "DOOMSCROLLING DETECTED!" if doomscroll_on else "No doomscroll"
  
         cv2.rectangle(annotated, (0, 0), (FRAME_WIDTH, 38), (0, 0, 0), -1)
         cv2.rectangle(annotated, (0, 0), (FRAME_WIDTH, 38), bar_color, 3)
